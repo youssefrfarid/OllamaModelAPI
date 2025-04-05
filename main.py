@@ -1,20 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from ollama import chat
 
 app = FastAPI()
-
-# In-memory store for conversation contexts keyed by a session_id.
-conversations = {}
-
-
-def save_file(upload_file: UploadFile, destination: str) -> str:
-    """
-    Saves an uploaded file to a local destination.
-    """
-    with open(destination, "wb") as f:
-        f.write(upload_file.file.read())
-    return destination
 
 
 @app.post("/chat")
@@ -23,27 +11,31 @@ async def chat_endpoint(
     image: UploadFile = File(...)
 ):
     """
-    Endpoint to start a new conversation or continue one by providing
-    an image and an initial message. The conversation context is saved
-    under the given session_id.
+    Endpoint to start a conversation.
+    Expects a 'message' field and an image file in the form data.
+    The image is read in memory and its raw bytes are passed to the Ollama API.
+    The response is streamed back to the client as text.
     """
-    # Save the uploaded image file temporarily.
-    image_path = f"temp_{image.filename}"
-    save_file(image, image_path)
+    # Read image file in memory as raw bytes.
+    try:
+        image_bytes = await image.read()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail="Error reading image file.")
 
     messages = [{
         "role": "user",
         "content": message,
-        "images": [image_path]
+        "images": [image_bytes]
     }]
 
-    response_text = ""
-    # Get streaming response from Ollama.
-    stream = chat(model='minicpm-v', messages=messages, stream=True)
-    for chunk in stream:
-        response_text += chunk['message']['content']
+    # Generator that streams chunks from the Ollama API.
+    def generate():
+        stream = chat(model='minicpm-v', messages=messages, stream=True)
+        for chunk in stream:
+            yield chunk['message']['content']
 
-    return {"response": response_text}
+    return StreamingResponse(generate(), media_type="text/plain")
 
 
 @app.post("/continue")
@@ -51,29 +43,37 @@ async def continue_endpoint(
     image: UploadFile = File(...)
 ):
     """
-    Endpoint to continue an existing conversation using a new image and prompt.
-    The existing conversation context is retrieved using the session_id.
+    Endpoint to continue an existing conversation.
+    Expects an image file in the form data.
+    The image is read in memory and its raw bytes are passed to the Ollama API with a predefined prompt.
+    The response is streamed back to the client as text.
     """
-    # Save the uploaded image file temporarily.
-    image_path = f"temp_{image.filename}"
-    save_file(image, image_path)
+    try:
+        image_bytes = await image.read()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail="Error reading image file.")
 
-    # Build prompt content with the new prompt.
-    content = "You should guide visually impaired people. Keep the scene description short and to the point include any signs or any obstacles in the scene. Describe the positoining of objects in the scene. The image is from the persons pov keep it as short as possible"
+    # Predefined prompt to guide visually impaired people.
+    content = (
+        "You should guide visually impaired people. Keep the scene description short and to the point, "
+        "including any signs or obstacles. Describe the positioning of objects in the scene. "
+        "The image is from the person's POV so keep it as short as possible."
+    )
 
     messages = [{
         "role": "user",
         "content": content,
-        "images": [image_path]
+        "images": [image_bytes]
     }]
 
-    response_text = ""
-    # Stream the response from Ollama.
-    stream = chat(model='minicpm-v', messages=messages, stream=True)
-    for chunk in stream:
-        response_text += chunk['message']['content']
+    def generate():
+        stream = chat(model='minicpm-v', messages=messages, stream=True)
+        for chunk in stream:
+            yield chunk['message']['content']
 
-    return {"response": response_text}
+    return StreamingResponse(generate(), media_type="text/plain")
+
 
 if __name__ == "__main__":
     import uvicorn
